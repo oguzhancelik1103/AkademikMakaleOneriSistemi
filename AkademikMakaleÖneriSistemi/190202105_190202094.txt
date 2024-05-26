@@ -1,0 +1,488 @@
+app.py
+
+from flask import Flask, request, render_template, redirect, url_for, session
+from werkzeug.security import generate_password_hash, check_password_hash
+from pymongo import MongoClient
+import pandas as pd
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+import nltk
+from nltk.corpus import stopwords
+from nltk.stem import PorterStemmer
+import string
+
+app = Flask(__name__)
+app.secret_key = 'erkanenaktarlarkoltuginaltindakalikbeniara89'
+
+# İngilizce durak kelimeleri indiriliyor ve stopwords seti oluşturuluyor.
+nltk.download('stopwords')
+stop_words = set(stopwords.words('english'))
+ps = PorterStemmer()
+
+# Metin ön işleme fonksiyonu: noktalama işaretleri kaldırılır, küçük harfe dönüştürülür ve kökleri bulunur.
+def preprocess(text):
+    text = text.translate(str.maketrans('', '', string.punctuation)).lower()
+    return ' '.join([ps.stem(word) for word in text.split() if word not in stop_words])
+
+# MongoDB bağlantısı kuruluyor.
+client = MongoClient('mongodb://localhost:27017/')
+db = client['AkademikMakaleOneriSistemi']
+users_collection = db['Users']
+
+# Makale verileri okunuyor ve başlıklar ön işlemden geçiriliyor.
+df = pd.read_csv('cleaned_combined_articles.csv').dropna(subset=['title'])
+df['processed_title'] = df['title'].apply(preprocess)
+vectorizer = TfidfVectorizer()
+tfidf_matrix = vectorizer.fit_transform(df['processed_title'])
+cosine_sim = cosine_similarity(tfidf_matrix)
+
+# Kullanıcının okuma geçmişini güncelleyen fonksiyon.
+def update_reading_history(user_email, recommended_articles):
+    users_collection.update_one(
+        {"email": user_email},
+        {"$push": {"reading_history": {"$each": recommended_articles}}}
+    )
+
+# Kişiselleştirilmiş makale önerileri getiren fonksiyon.
+def get_personalized_recommendations(user_email, search_query=""):
+    user = users_collection.find_one({"email": user_email})
+    if not user:
+        return pd.DataFrame()
+
+    interests_weighted = user.get('interests', []) * 1
+    search_query_weighted = [search_query] * 8
+    reading_history_weighted = user.get('reading_history', []) * 1
+
+    combined_input = interests_weighted + search_query_weighted + reading_history_weighted
+    processed_input = [preprocess(text) for text in combined_input]
+    input_vector = vectorizer.transform([' '.join(processed_input)])
+    
+    sim_scores = list(enumerate(cosine_similarity(input_vector, tfidf_matrix).flatten()))
+    sim_scores = sorted(sim_scores, key=lambda x: x[1], reverse=True)[:50]
+    
+    seen_titles = set()
+    unique_articles = []
+    for index, score in sim_scores:
+        title = df.iloc[index]['title']
+        if title not in seen_titles:
+            seen_titles.add(title)
+            unique_articles.append(index)
+        if len(unique_articles) == 10:
+            break
+
+    recommended_articles = df.iloc[unique_articles]['title'].tolist()
+    update_reading_history(user_email, recommended_articles)
+    return df.iloc[unique_articles]
+
+# Rotalar ve ilgili fonksiyonlar tanımlanıyor.
+@app.route('/recommend', methods=['POST'])
+def recommend():
+    if 'email' not in session:
+        return redirect(url_for('login'))
+    
+    search_query = request.form.get('search_query', '')
+    recommendations = get_personalized_recommendations(session['email'], search_query)
+    
+    if recommendations.empty:
+        return render_template('recommendations.html', articles=[], message="No recommendations found based on your interests.")
+    
+    return render_template('recommendations.html', articles=recommendations.to_dict('records'))
+
+@app.route('/')
+def home():
+    return render_template('index.html')
+
+@app.route('/register', methods=['GET', 'POST'])
+def register():
+    if request.method == 'POST':
+        email = request.form['email']
+        password = request.form['password']
+        interests = request.form.getlist('interests')
+        if users_collection.find_one({"email": email}):
+            return 'Email already exists'
+        users_collection.insert_one({"email": email, "password": generate_password_hash(password, 'pbkdf2:sha256'), "interests": interests, "reading_history": []})
+        return redirect(url_for('login'))
+    return render_template('register.html')
+
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if request.method == 'POST':
+        email = request.form['email']
+        password = request.form['password']
+        user = users_collection.find_one({"email": email})
+        if user and check_password_hash(user['password'], password):
+            session['email'] = email
+            return redirect(url_for('dashboard'))
+        return 'Invalid email or password'
+    return render_template('login.html')
+
+@app.route('/dashboard', methods=['GET', 'POST'])
+def dashboard():
+    if 'email' not in session:
+        return redirect(url_for('login'))
+    user = users_collection.find_one({"email": session['email']})
+    return render_template('dashboard.html', interests=user.get('interests', 'Not set'))
+
+@app.route('/profile', methods=['GET', 'POST'])
+def profile():
+    if 'email' not in session:
+        return redirect(url_for('login'))
+    if request.method == 'POST':
+        name = request.form['name']
+        surname = request.form['surname']
+        email = request.form['email']
+        interests = request.form.getlist('interests')
+        users_collection.update_one({"email": session['email']}, {"$set": {"name": name, "surname": surname, "email": email, "interests": interests}})
+        session['email'] = email
+        return redirect(url_for('dashboard'))
+    user = users_collection.find_one({"email": session['email']})
+    return render_template('profile.html', user=user)
+
+@app.route('/logout')
+def logout():
+    session.pop('email', None)
+    return redirect(url_for('home'))
+
+if __name__ == '__main__':
+    app.run(debug=True)
+---------------------------------------------------------------------------------------------------
+
+datacleaning.py
+
+import pandas as pd
+
+# Veri çerçevesini yükleyelim
+df = pd.read_csv('combined_articles.csv')
+
+# Bir satırda birden fazla başlık varsa ayırma işlemi
+def split_multiple_titles(row):
+    if isinstance(row['title'], str):
+        titles = row['title'].split('\n')
+        
+        # Her başlığı ayrı bir satıra yerleştir
+        rows = []
+        for title in titles:
+            rows.append({'title': title.strip()})
+        return rows
+    else:
+        return [{'title': row['title']}]
+
+# Yeni bir DataFrame oluşturmak için tüm satırları işleyelim
+new_rows = []
+for _, row in df.iterrows():
+    new_rows.extend(split_multiple_titles(row))
+
+cleaned_df = pd.DataFrame(new_rows)
+
+# "R" ile başlayan başlıkları temizleyelim
+cleaned_df = cleaned_df[~cleaned_df['title'].str.startswith('R', na=False)]
+
+# Temizlenmiş veri setini kaydedelim
+cleaned_df.to_csv('cleaned_combined_articles.csv', index=False)
+
+print("Veri seti temizlendi ve 'cleaned_combined_articles.csv' dosyasına kaydedildi.")
+----------------------------------------------------------------------------------------------------
+
+dataloading.py
+
+import zipfile
+import pandas as pd
+import os
+
+# Zip dosyalarının yollarını belirleyelim
+inspec_zip_path = 'C:/Users/DELL/Desktop/Inspec.zip'
+krapivin_zip_path = 'C:/Users/DELL/Desktop/Krapivin2009.zip'
+
+# Zip dosyalarını açalım ve verileri çıkaralım
+with zipfile.ZipFile(inspec_zip_path, 'r') as zip_ref:
+    zip_ref.extractall('Inspec')
+
+with zipfile.ZipFile(krapivin_zip_path, 'r') as zip_ref:
+    zip_ref.extractall('Krapivin2009')
+
+# Inspec verilerini okuyalım
+inspec_docsutf8_folder_path = 'Inspec/Inspec/docsutf8'
+inspec_docsutf8_files = os.listdir(inspec_docsutf8_folder_path)
+
+inspec_articles = []
+
+for file_name in inspec_docsutf8_files:
+    file_path = os.path.join(inspec_docsutf8_folder_path, file_name)
+    with open(file_path, 'r', encoding='utf-8') as file:
+        content = file.read()
+        lines = content.split('\n')
+        title = lines[0]
+        abstract = ' '.join(lines[1:])
+        inspec_articles.append({
+            'title': title,
+            'abstract': abstract
+        })
+
+inspec_df = pd.DataFrame(inspec_articles)
+
+# Krapivin verilerini okuyalım
+krapivin_docsutf8_folder_path = 'Krapivin2009/Krapivin2009/docsutf8'
+krapivin_docsutf8_files = os.listdir(krapivin_docsutf8_folder_path)
+
+krapivin_articles = []
+
+for file_name in krapivin_docsutf8_files:
+    file_path = os.path.join(krapivin_docsutf8_folder_path, file_name)
+    with open(file_path, 'r', encoding='utf-8') as file:
+        content = file.read()
+        parts = content.split('--')
+        title = ''
+        abstract = ''
+        for part in parts:
+            if part.startswith('T'):
+                title = part[1:].strip()
+            elif part.startswith('A'):
+                abstract = part[1:].strip()
+        krapivin_articles.append({
+            'title': title,
+            'abstract': abstract
+        })
+
+krapivin_df = pd.DataFrame(krapivin_articles)
+
+# Veri çerçevelerini birleştirelim
+combined_df = pd.concat([inspec_df, krapivin_df], ignore_index=True)
+
+# İlk birkaç satırı inceleyelim
+print(combined_df.head())
+
+# Veri çerçevesini bir dosyaya kaydedelim
+combined_df.to_csv('combined_articles.csv', index=False)
+-----------------------------------------------------------------------------------------
+
+evalutation.py
+
+import pandas as pd
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.model_selection import train_test_split
+import nltk
+from nltk.corpus import stopwords
+from nltk.stem import PorterStemmer
+import string
+
+# Gerekli NLTK verilerini indir
+nltk.download('stopwords')
+
+# İngilizce stopwords listesi
+stop_words = set(stopwords.words('english'))
+ps = PorterStemmer()
+
+# Metin işleme fonksiyonu
+def preprocess(text):
+    text = text.translate(str.maketrans('', '', string.punctuation))
+    text = text.lower()
+    text = ' '.join([ps.stem(word) for word in text.split() if word not in stop_words])
+    return text
+
+# Temizlenmiş veri çerçevesini yükleyelim
+df = pd.read_csv('cleaned_combined_articles.csv')
+
+# Eksik değerleri içeren satırları kaldıralım
+df = df.dropna(subset=['title'])
+
+# Metin ön işleme
+df['processed_title'] = df['title'].apply(preprocess)
+
+# Eğitim ve test verisi olarak ayıralım
+train_df, test_df = train_test_split(df, test_size=0.3, random_state=42)
+
+# Veri çerçevelerinin boyutlarını kontrol edelim
+print(f"Toplam veri sayısı: {len(df)}")
+print(f"Eğitim verisi sayısı: {len(train_df)}")
+print(f"Test verisi sayısı: {len(test_df)}")
+
+# TF-IDF vektörleştirme
+vectorizer = TfidfVectorizer()
+tfidf_matrix_train = vectorizer.fit_transform(train_df['processed_title'])
+tfidf_matrix_test = vectorizer.transform(test_df['processed_title'])
+
+# Kosinüs benzerliği matrisini hesaplayalım
+cosine_sim_train = cosine_similarity(tfidf_matrix_train, tfidf_matrix_train)
+cosine_sim_test = cosine_similarity(tfidf_matrix_test, tfidf_matrix_train)
+
+# Benzerlik matrislerinin boyutlarını kontrol edelim
+print(f"TF-IDF eğitim matrisi boyutu: {tfidf_matrix_train.shape}")
+print(f"TF-IDF test matrisi boyutu: {tfidf_matrix_test.shape}")
+print(f"Kosinüs benzerliği eğitim matrisi boyutu: {cosine_sim_train.shape}")
+print(f"Kosinüs benzerliği test matrisi boyutu: {cosine_sim_test.shape}")
+
+# Eğitim veri setinde olmayan test başlıklarını filtreleme
+test_titles = test_df['title'].tolist()
+valid_test_titles = [title for title in test_titles if title in train_df['title'].values]
+invalid_test_titles = [title for title in test_titles if title not in train_df['title'].values]
+
+print(f"Eğitim veri setinde olmayan test başlıkları sayısı: {len(invalid_test_titles)}")
+print(f"Eğitim veri setinde olan test başlıkları sayısı: {len(valid_test_titles)}")
+
+# Eğitim veri setinde olmayan başlıkları yazdırma
+print("Eğitim veri setinde olmayan test başlıkları:")
+for title in invalid_test_titles[:5]:  # İlk 5 başlık
+    print(title)
+
+# Geçerli test başlıkları için dataframe oluşturma
+valid_test_df = test_df[test_df['title'].isin(valid_test_titles)]
+
+# Öneri fonksiyonu (eğitim verisi için)
+def get_recommendations(title, df, cosine_sim):
+    try:
+        idx = df[df['title'] == title].index[0]
+    except IndexError:
+        print(f"Başlık bulunamadı: {title}")
+        return pd.DataFrame()
+
+    if idx >= cosine_sim.shape[0]:
+        print(f"İndeks {idx} geçersiz, benzerlik matrisinin sınırlarının dışında")
+        return pd.DataFrame()
+
+    sim_scores = list(enumerate(cosine_sim[idx]))
+    sim_scores = sorted(sim_scores, key=lambda x: x[1], reverse=True)
+    sim_scores = sim_scores[1:11]
+    valid_sim_scores = [score for score in sim_scores if score[0] < len(df)]
+
+    article_indices = [i[0] for i in valid_sim_scores]
+
+    if not article_indices:
+        print("Geçerli bir benzer makale bulunamadı.")
+        return pd.DataFrame()
+
+    return df.iloc[article_indices][['title']]
+
+# Değerlendirme (eğitim verisi)
+def evaluate_recommendations(df, cosine_sim):
+    test_titles = df['title'].tolist()
+    for title in test_titles[:5]:  # İlk 5 başlık için değerlendirme yapıyoruz
+        print(f"\nBaşlık: {title}")
+        recommendations = get_recommendations(title, df, cosine_sim)
+        if not recommendations.empty:
+            print(f"Öneriler '{title}' için:")
+            print(recommendations)
+        else:
+            print("Geçerli öneri bulunamadı.")
+
+# Değerlendirme süreci (eğitim verisi)
+print("Eğitim verisi değerlendirmesi:")
+evaluate_recommendations(train_df, cosine_sim_train)
+
+# Test verisi için öneri fonksiyonu (eğitim verisine göre)
+def get_test_recommendations(title, test_df, train_df, cosine_sim_test):
+    try:
+        idx = test_df[test_df['title'] == title].index[0]
+    except IndexError:
+        print(f"Başlık bulunamadı: {title}")
+        return pd.DataFrame()
+
+    if idx >= cosine_sim_test.shape[0]:
+        print(f"İndeks {idx} geçersiz, benzerlik matrisinin sınırlarının dışında")
+        return pd.DataFrame()
+
+    sim_scores = list(enumerate(cosine_sim_test[idx]))
+    sim_scores = sorted(sim_scores, key=lambda x: x[1], reverse=True)
+    sim_scores = sim_scores[1:11]
+    valid_sim_scores = [score for score in sim_scores if score[0] < len(train_df)]
+
+    article_indices = [i[0] for i in valid_sim_scores]
+
+    if not article_indices:
+        print("Geçerli bir benzer makale bulunamadı.")
+        return pd.DataFrame()
+
+    return train_df.iloc[article_indices][['title']]
+
+# Değerlendirme süreci (test verisi)
+print("\nTest verisi değerlendirmesi:")
+for title in valid_test_titles[:5]:  # İlk 5 başlık için değerlendirme yapıyoruz
+    print(f"\nBaşlık: {title}")
+    recommendations = get_test_recommendations(title, valid_test_df, train_df, cosine_sim_test)
+    if not recommendations.empty:
+        print(f"Öneriler '{title}' için:")
+        print(recommendations)
+    else:
+        print("Geçerli öneri bulunamadı.")
+--------------------------------------------------------------------------------------------
+recommendation.py
+
+import pandas as pd
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+import nltk
+from nltk.corpus import stopwords
+from nltk.stem import PorterStemmer
+import string
+
+# Gerekli NLTK verilerini indir
+nltk.download('stopwords')
+
+# İngilizce stopwords listesi
+stop_words = set(stopwords.words('english'))
+ps = PorterStemmer()
+
+# Metin işleme fonksiyonu
+def preprocess(text):
+    # Noktalama işaretlerini çıkar
+    text = text.translate(str.maketrans('', '', string.punctuation))
+    # Küçük harfe çevir
+    text = text.lower()
+    # Kelime köklerini bul ve stopwords temizle
+    text = ' '.join([ps.stem(word) for word in text.split() if word not in stop_words])
+    return text
+
+# Veri çerçevesini yükleyelim
+df = pd.read_csv('combined_articles.csv')
+
+# Eksik değerleri içeren satırları kaldıralım
+df = df.dropna(subset=['abstract'])
+
+# Metin ön işleme
+df['processed_abstract'] = df['abstract'].apply(preprocess)
+
+# TF-IDF vektörleştirme
+vectorizer = TfidfVectorizer()
+tfidf_matrix = vectorizer.fit_transform(df['processed_abstract'])
+
+# Kosinüs benzerliği matrisini hesaplayalım
+cosine_sim = cosine_similarity(tfidf_matrix, tfidf_matrix)
+
+# Öneri fonksiyonu
+def get_recommendations(title, cosine_sim=cosine_sim):
+    # Verilen başlığa göre makalenin indeksini bulalım
+    idx = df[df['title'] == title].index[0]
+
+    # Tüm makalelerle olan benzerlik skorlarını alalım
+    sim_scores = list(enumerate(cosine_sim[idx]))
+
+    # Benzerlik skorlarına göre makaleleri azalan sırayla sıralayalım
+    sim_scores = sorted(sim_scores, key=lambda x: x[1], reverse=True)
+
+    # İlk 10 benzer makaleyi alalım
+    sim_scores = sim_scores[1:11]
+
+    # Benzer makalelerin indekslerini alalım
+    article_indices = [i[0] for i in sim_scores]
+
+    # Benzer makaleleri döndürelim
+    return df.iloc[article_indices][['title', 'abstract']]
+
+# "human" kelimesini içeren başlıkları listeleyelim
+human_titles = df[df['title'].str.contains("human", case=False, na=False)]
+
+if human_titles.empty:
+    print("Human ile ilgili başlık bulunamadı.")
+else:
+    print("Human ile ilgili başlıklar:")
+    print(human_titles[['title']])
+
+    # Uygun bir başlık seçelim
+    example_title = human_titles['title'].iloc[0]  # İlk başlığı seçiyoruz, bunu değiştirebilirsin
+
+    # Seçtiğimiz başlık için öneriler alalım
+    recommendations = get_recommendations(example_title)
+
+    # Önerileri görüntüleyelim
+    print(f"Öneriler '{example_title}' için:")
+    print(recommendations)

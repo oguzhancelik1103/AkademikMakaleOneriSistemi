@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Önerilen Makaleler</title>
+    <link href="https://maxcdn.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css" rel="stylesheet">
+</head>
+<body>
+    <div class="container">
+        <h1 class="mt-5">Önerilen Makaleler</h1>
+        {% if articles %}
+        <ul class="list-group">
+            {% for article in articles %}
+            <li class="list-group-item">{{ article.title }}</li>
+            {% endfor %}
+        </ul>
+        {% else %}
+        <p>{{ message }}</p>
+        {% endif %}
+        <a href="{{ url_for('dashboard') }}" class="btn btn-primary mt-3">Geri Dön</a>
+    </div>
+</body>
+</html>

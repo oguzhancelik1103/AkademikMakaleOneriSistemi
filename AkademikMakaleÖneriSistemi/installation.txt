@@ -1,0 +1,11 @@
+python -m venv venv
+
+.\venv\Scripts\activate
+
+pip install pandas
+pip install numpy
+pip install matplotlib
+pip install scikit-learn
+pip install tensorflow
+
+python iris-model.py
